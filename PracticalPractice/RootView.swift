@@ -8,6 +8,9 @@ struct PracticalPracticeApp: App {
                 Tab("Contacts", systemImage: "person.crop.circle") {
                     UserListView()
                 }
+                Tab("Photos", systemImage: "photo.on.rectangle") {
+                    PhotoFeedView()
+                }
             }
         }
     }
