@@ -10,9 +10,11 @@ struct Stage2Photo: Codable, Identifiable {
     let thumbnailUrl: String
 }
 
-// MARK: - Service (CHANGED — added page + limit params)
+// MARK: - Service (CHANGED — added page + limit params for pagination)
 
 struct Stage2PhotoService {
+    // page + limit enable server-side pagination via query params
+    // Default limit = 10 so callers don't have to specify it every time
     func fetchPhotos(page: Int, limit: Int = 10) async throws -> [Stage2Photo] {
         let url = URL(string: "https://jsonplaceholder.typicode.com/photos?albumId=1&_page=\(page)&_limit=\(limit)")!
         let (data, response) = try await URLSession.shared.data(from: url)
@@ -22,12 +24,14 @@ struct Stage2PhotoService {
             throw URLError(.badServerResponse)
         }
 
+        // Returns empty array [] when past the last page — that's how we detect end-of-list
         return try JSONDecoder().decode([Stage2Photo].self, from: data)
     }
 }
 
 // MARK: - State
 
+// Same ViewState as Stage 1 — handles initial load lifecycle
 enum Stage2ViewState<T> {
     case idle
     case loading
@@ -35,11 +39,14 @@ enum Stage2ViewState<T> {
     case error(String)
 }
 
+// NEW in Stage 2 — tracks pagination separately from initial load
+// Why separate? A failed page 3 shouldn't blow away pages 1-2 already on screen
+// Equatable: allows guard checks like `paginationState == .idle`
 enum Stage2PaginationState: Equatable {
-    case idle
-    case loading
-    case error(String)
-    case done
+    case idle       // ready to fetch next page
+    case loading    // fetching next page right now
+    case error(String) // next page failed (existing data preserved)
+    case done       // no more pages — API returned empty array
 }
 
 // MARK: - ViewModel (CHANGED — added pagination logic)
@@ -47,13 +54,17 @@ enum Stage2PaginationState: Equatable {
 @MainActor
 @Observable
 final class Stage2ViewModel {
+    // Accumulated photos across all loaded pages
     private(set) var photos: [Stage2Photo] = []
+    // Overall screen state (initial load)
     private(set) var state: Stage2ViewState<[Stage2Photo]> = .idle
+    // Pagination-specific state (subsequent page loads)
     private(set) var paginationState: Stage2PaginationState = .idle
 
     private var currentPage = 1
     private let service = Stage2PhotoService()
 
+    // Called on first load — resets everything
     func fetchInitialPhotos() async {
         state = .loading
         currentPage = 1
@@ -62,13 +73,17 @@ final class Stage2ViewModel {
             let photos = try await service.fetchPhotos(page: currentPage)
             self.photos = photos
             state = .loaded(photos)
+            // If first page is empty, there's nothing to paginate
             paginationState = photos.isEmpty ? .done : .idle
         } catch {
+            // Initial load failure → full-screen error (we have nothing to show)
             state = .error(error.localizedDescription)
         }
     }
 
+    // Called when user scrolls near bottom
     func fetchNextPage() async {
+        // Guard prevents duplicate fetches — if already loading, done, or in error, bail out
         guard paginationState == .idle else { return }
 
         paginationState = .loading
@@ -76,20 +91,25 @@ final class Stage2ViewModel {
         do {
             let newPhotos = try await service.fetchPhotos(page: nextPage)
             if newPhotos.isEmpty {
+                // Empty response = no more data on the server
                 paginationState = .done
             } else {
+                // Append (not replace) — preserves existing photos
                 photos.append(contentsOf: newPhotos)
                 state = .loaded(photos)
                 currentPage = nextPage
                 paginationState = .idle
             }
         } catch {
+            // Pagination error only affects the footer — existing photos stay visible
             paginationState = .error(error.localizedDescription)
         }
     }
 
+    // Called from .onAppear on each row — triggers next page when last item is visible
     func shouldFetchMore(currentItem: Stage2Photo) -> Bool {
         guard let lastItem = photos.last else { return false }
+        // Only fetch if this is the last item AND we're in idle state
         return currentItem.id == lastItem.id && paginationState == .idle
     }
 }
@@ -128,8 +148,11 @@ struct Stage2FeedView: View {
 
     private var photoList: some View {
         List {
+            // ForEach instead of List(photos) so we can add the footer outside the loop
             ForEach(viewModel.photos) { photo in
                 Stage2RowView(photo: photo)
+                    // .onAppear: fires when this row becomes visible on screen
+                    // Triggers next page fetch when the last item scrolls into view
                     .onAppear {
                         if viewModel.shouldFetchMore(currentItem: photo) {
                             Task { await viewModel.fetchNextPage() }
@@ -137,20 +160,24 @@ struct Stage2FeedView: View {
                     }
             }
 
+            // Footer sits below the list items — shows pagination state
             paginationFooter
         }
     }
 
+    // @ViewBuilder: lets you return different view types from a switch without wrapping in AnyView
     @ViewBuilder
     private var paginationFooter: some View {
         switch viewModel.paginationState {
         case .loading:
+            // Centered spinner while next page loads
             HStack {
                 Spacer()
                 ProgressView()
                 Spacer()
             }
         case .error(let message):
+            // Inline error + retry — does NOT replace existing content
             VStack(spacing: 8) {
                 Text(message)
                     .font(.caption)
@@ -160,6 +187,7 @@ struct Stage2FeedView: View {
                 }
             }
         case .done:
+            // End of feed indicator
             HStack {
                 Spacer()
                 Text("End of feed")
@@ -168,6 +196,7 @@ struct Stage2FeedView: View {
                 Spacer()
             }
         case .idle:
+            // Nothing to show — waiting for scroll trigger
             EmptyView()
         }
     }

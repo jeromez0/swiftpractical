@@ -2,6 +2,7 @@ import SwiftUI
 
 // MARK: - Model
 
+// Hashable: required by NavigationLink(value:) for type-safe navigation (if needed)
 struct Photo: Codable, Identifiable, Hashable {
     let albumId: Int
     let id: Int
@@ -26,22 +27,32 @@ struct PhotoService {
     }
 }
 
-// MARK: - Image Loader
+// MARK: - Image Loader (NEW in Stage 3 — replaces AsyncImage)
 
+// Why replace AsyncImage? AsyncImage has NO caching — it re-fetches every time a view reappears.
+// In a scrollable feed, scrolling back up triggers new network requests for already-seen images.
+
+// class (not struct): owns mutable state (the cache). Singleton so cache is shared app-wide.
 final class ImageLoader {
     static let shared = ImageLoader()
+    // NSCache: thread-safe (no lock needed), auto-evicts under memory pressure
+    // Keys must be NSObject — NSURL bridges from URL for free
     private let cache = NSCache<NSURL, UIImage>()
 
+    // Single entry point — caller doesn't know or care about caching strategy
     func loadImage(from url: URL) async throws -> UIImage {
+        // Check cache first — instant return, no network
         if let cached = cache.object(forKey: url as NSURL) {
             return cached
         }
 
+        // Cache miss — fetch from network
         let (data, _) = try await URLSession.shared.data(from: url)
         guard let image = UIImage(data: data) else {
             throw URLError(.cannotDecodeContentData)
         }
 
+        // Store in cache for future requests
         cache.setObject(image, forKey: url as NSURL)
         return image
     }
@@ -66,6 +77,8 @@ final class PhotoFeedViewModel {
     private var currentPage = 1
     private let service: PhotoService
 
+    // Service injected via init — default param means views create with zero config,
+    // but tests can inject a mock. Mention this; don't build tests.
     init(service: PhotoService = PhotoService()) {
         self.service = service
     }
@@ -189,11 +202,14 @@ struct PhotoFeedView: View {
     }
 }
 
+// MARK: - Row (CHANGED — uses CachedAsyncImage instead of AsyncImage)
+
 struct PhotoRowView: View {
     let photo: Photo
 
     var body: some View {
         HStack(spacing: 12) {
+            // CachedAsyncImage: our custom replacement for AsyncImage — caches via ImageLoader
             CachedAsyncImage(url: URL(string: photo.thumbnailUrl))
                 .frame(width: 60, height: 60)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -206,23 +222,29 @@ struct PhotoRowView: View {
     }
 }
 
+// MARK: - CachedAsyncImage (NEW in Stage 3)
+
 struct CachedAsyncImage: View {
     let url: URL?
 
+    // @State: local view state — preserved across re-renders, reset when view identity changes
     @State private var image: UIImage?
     @State private var isLoading = true
 
     var body: some View {
         Group {
             if let image {
+                // Image(uiImage:) — bridges UIKit's UIImage to SwiftUI's Image
                 Image(uiImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
             } else if isLoading {
+                // Placeholder while image loads
                 Rectangle()
                     .fill(Color.gray.opacity(0.2))
                     .overlay(ProgressView())
             } else {
+                // Error state — image failed to load
                 Rectangle()
                     .fill(Color.gray.opacity(0.2))
                     .overlay(
@@ -231,6 +253,11 @@ struct CachedAsyncImage: View {
                     )
             }
         }
+        // .task(id: url) — THE KEY LINE for cell reuse:
+        // When `url` changes (cell reused for different photo), SwiftUI:
+        //   1. Cancels the old task (in-flight URLSession request throws CancellationError)
+        //   2. Starts a new task with the new url
+        // This prevents stale images from appearing in reused cells — no manual tracking needed
         .task(id: url) {
             await loadImage()
         }
@@ -246,9 +273,11 @@ struct CachedAsyncImage: View {
         image = nil
 
         do {
+            // ImageLoader handles cache check + network fetch + cache store
+            // The view doesn't know about caching strategy — just asks for an image
             image = try await ImageLoader.shared.loadImage(from: url)
         } catch {
-            // Cancelled (cell reuse) or network failure — show placeholder
+            // CancellationError (cell reuse) or network failure — placeholder stays visible
         }
         isLoading = false
     }
