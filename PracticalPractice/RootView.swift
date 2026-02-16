@@ -11,6 +11,9 @@ struct PracticalPracticeApp: App {
                 Tab("Photos", systemImage: "photo.on.rectangle") {
                     PhotoFeedView()
                 }
+                Tab("Portfolio", systemImage: "chart.line.uptrend.xyaxis") {
+                    PortfolioView()
+                }
             }
         }
     }
